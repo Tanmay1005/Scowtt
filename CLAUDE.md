@@ -150,13 +150,24 @@ For candidate cutoffs (2018-07-01, 2018-07-15, 2018-08-01) × window sizes (30/4
 - Print table: `cutoff × window_size → positive_count`
 - Decision: ≥200 → proceed; <200 at 30-day → widen to 60; <100 at 60 → reframe problem
 
-### Cell 23 (markdown): Temporal Split Rationale
+### Cell 23 (markdown): Order Status Filtering
+> **`had_canceled_order`** is computed on unfiltered `order_master` — it explicitly looks for canceled/unavailable orders, so we need them present. After computing this flag per user, we filter:
+>
+> - **Feature aggregation** uses `order_status == 'delivered'` only. Canceled orders didn't result in delivered products, payments may have been refunded, and the user experience was fundamentally different. Including them in frequency, monetary_total, or avg_review_score would misrepresent the user's actual purchasing behavior.
+> - **Label definition** uses `order_status == 'delivered'` only. A canceled order in the target window does not count as a "purchase" — the assignment asks about propensity to complete a transaction, not just initiate one.
+>
+> Document the count of excluded orders so the reader knows what was dropped (~2,963 non-delivered out of ~99,441 total).
+
+### Cell 24 (markdown): Temporal Split Rationale
 > We split by time, not randomly, to prevent data leakage. Features are built ONLY from orders before the cutoff date. Targets are defined ONLY by orders after the cutoff. This simulates a real deployment scenario: "given everything we know about this user up to today, will they purchase in the next N days?" Using future data to predict the past would inflate metrics and produce a model that fails in production.
 
-### Cell 24 (code): Temporal split → feature_orders + label_orders
-Leakage check: `assert feature_orders.order_purchase_timestamp.max() < cutoff`
+### Cell 25 (code): Temporal split → feature_orders + label_orders
+- Compute `had_canceled_order` per user on unfiltered order_master FIRST
+- Filter to `order_status == 'delivered'` for both feature_orders and label_orders
+- Print count of excluded non-delivered orders
+- Leakage check: `assert feature_orders.order_purchase_timestamp.max() < cutoff`
 
-### Cell 25 (markdown): Feature Engineering Decisions
+### Cell 26 (markdown): Feature Engineering Decisions
 > **36 features across 8 categories.** Key design choices:
 >
 > **`monetary_total` is kept** despite being correlated with `avg_order_value × frequency`. LightGBM (tree-based) is not affected by multicollinearity — trees split on one feature at a time and are immune to the instability that collinearity causes in linear models. We use SHAP values (not split-based importance) for interpretability, which correctly attributes importance across correlated features.
@@ -170,7 +181,7 @@ Leakage check: `assert feature_orders.order_purchase_timestamp.max() < cutoff`
 > - `is_capital_state` — requires fuzzy matching of messy city names to 27 state capitals; high engineering cost for marginal lift
 > - `score_x_delivery` — multiplication of unrelated scales (review 1-5 × delivery_delta -150 to +190); dominated by delivery_delta magnitude; LightGBM discovers interactions naturally through sequential splits
 
-### Cell 26 (code): Aggregate to per-user level (36 features)
+### Cell 27 (code): Aggregate to per-user level (36 features)
 
 **36 features across 8 categories:**
 | Category (count) | Features |
@@ -188,7 +199,7 @@ Leakage check: `assert feature_orders.order_purchase_timestamp.max() < cutoff`
 - `freight_ratio`: `np.where(monetary_total > 0, total_freight / monetary_total, 0)` — prevents division by zero on voucher-only purchases
 - `avg_approval_hrs`: cap at 99th percentile — max is ~4,509 hours (188 days), clearly erroneous; uncapped values distort SHAP plots
 
-### Cell 27 (code): Construct target variables + print class counts
+### Cell 28 (code): Construct target variables + print class counts
 - `target_purchased` (binary): 1 if user orders in target period
 - `target_order_value` (continuous): total payment in target period
 - Print: "X positives out of Y total users (Z%)"
@@ -200,15 +211,15 @@ Leakage check: `assert feature_orders.order_purchase_timestamp.max() < cutoff`
 ## PHASE 4: Model Training
 **Commit after completion**
 
-### Cell 28 (markdown): Train/Test Split Design
+### Cell 29 (markdown): Train/Test Split Design
 > The 80/20 split is a **random user-level split**, not a second temporal split. Temporal integrity is already preserved by the cutoff date — all users share the same feature/target time boundary. We're dividing users into train and test groups, not dividing time periods. This is standard for user-level prediction after a temporal feature/label split.
 >
 > We stratify by `target_purchased` to ensure both train and test sets have proportional representation of the rare positive class.
 
-### Cell 29 (code): Train/test split (80/20 stratified) + feature prep
+### Cell 30 (code): Train/test split (80/20 stratified) + feature prep
 Set categorical columns to `category` dtype. NaNs are left as-is (LightGBM native handling).
 
-### Cell 30 (markdown): Baseline Strategy
+### Cell 31 (markdown): Baseline Strategy
 > We train two baselines before the full model, for different reasons:
 >
 > **Baseline 1 — Recency ranking:** A sanity check. Rank users by days since last order (most recent = highest score). If our ML model can't beat "recent buyers are more likely to buy again," something is fundamentally wrong. This is a strawman we expect to beat easily.
@@ -217,23 +228,23 @@ Set categorical columns to `category` dtype. NaNs are left as-is (LightGBM nativ
 >
 > The logistic regression uses only numeric features, so no categorical encoding is needed (no conflict with our "no label encoding" rule for LightGBM).
 
-### Cell 31 (code): Baseline 1 — Recency ranking
-### Cell 32 (code): Baseline 2 — RFM logistic regression
+### Cell 32 (code): Baseline 1 — Recency ranking
+### Cell 33 (code): Baseline 2 — RFM logistic regression
 
-### Cell 33 (markdown): LightGBM Design Choices
+### Cell 34 (markdown): LightGBM Design Choices
 > **`is_unbalance=True`**: Tells LightGBM to automatically adjust for class imbalance by weighting the minority class. With a positive rate of ~0.1-0.3%, this is essential — without it, the model would learn to predict 0 for everyone and achieve >99% accuracy.
 >
 > **Categorical features via native handling**: We pass `categorical_feature` to `.fit()` so LightGBM partitions categories optimally at each split, rather than relying on arbitrary numeric encodings.
 >
 > **5-fold stratified CV**: Reports AUC-ROC and AUC-PR as mean ± std across folds. **Caveat**: stratified random folds on data derived from temporally-ordered events may be slightly optimistic vs true forward-looking performance. In production, expanding-window time-series CV would be more rigorous. For a take-home, stratified CV is standard and acceptable.
 
-### Cell 34 (code): LightGBM classifier + 5-fold CV
+### Cell 35 (code): LightGBM classifier + 5-fold CV
 ```python
 lgb.LGBMClassifier(n_estimators=500, learning_rate=0.05, max_depth=6,
     num_leaves=31, is_unbalance=True, random_state=42)
 ```
 
-### Cell 35 (markdown): Two-Stage Value Prediction
+### Cell 36 (markdown): Two-Stage Value Prediction
 > We use a two-stage hurdle model:
 > - **Stage 1**: Propensity model predicts P(purchase) for all users
 > - **Stage 2**: Value model predicts order value *given that a purchase happens*
@@ -245,7 +256,7 @@ lgb.LGBMClassifier(n_estimators=500, learning_rate=0.05, max_depth=6,
 > - If ≥200 purchasers in target window → train LightGBM Regressor on purchasers only, compare RMSE to historical average, use whichever performs better
 > - If <200 purchasers → use each user's historical `avg_order_value` as the prediction. Training a gradient boosting model on ~100 samples with 36 features will almost certainly overfit. A simple historical average is more robust and more defensible in an interview.
 
-### Cell 36 (code): Conversion value model
+### Cell 37 (code): Conversion value model
 
 **Commit message pattern:** `Phase 4: Baseline models and LightGBM training`
 
@@ -254,31 +265,31 @@ lgb.LGBMClassifier(n_estimators=500, learning_rate=0.05, max_depth=6,
 ## PHASE 5: Evaluation & Diagnostics
 **Commit after completion**
 
-### Cell 37 (markdown): Evaluation Framework
+### Cell 38 (markdown): Evaluation Framework
 > **Primary metric: AUC-PR (Average Precision)**, not accuracy or AUC-ROC.
 >
 > With a positive rate of ~0.1-0.3%, accuracy is meaningless — predicting 0 for everyone scores >99%. AUC-ROC can also be misleading at extreme imbalance because it weighs true negative rate heavily. AUC-PR focuses on precision and recall among predicted positives, which is what matters for ad targeting: of the users we'd target, what fraction actually converts?
 
-### Cell 38 (code): Classification comparison table + ROC/PR curves (all 3 models)
+### Cell 39 (code): Classification comparison table + ROC/PR curves (all 3 models)
 
-### Cell 39 (markdown): Why Calibration Matters
+### Cell 40 (markdown): Why Calibration Matters
 > Propensity scores should be interpretable as probabilities. If the model says 0.05, roughly 5% of those users should actually purchase. Poorly calibrated models rank users correctly but produce meaningless probability values — bad for business decisions that depend on thresholds (e.g., "target everyone with >3% propensity").
 >
 > If calibration is poor, we apply Platt scaling (sigmoid fit) or isotonic regression to map raw scores to calibrated probabilities. We re-evaluate the calibration plot after correction.
 
-### Cell 40 (code): Calibration plot + Platt scaling/isotonic if needed
+### Cell 41 (code): Calibration plot + Platt scaling/isotonic if needed
 
-### Cell 41 (code): Regression metrics (if regressor trained) + honest sample size caveat
+### Cell 42 (code): Regression metrics (if regressor trained) + honest sample size caveat
 > If regressor was trained on a small sample (<300 purchasers), note: "With N purchasers in the test set, RMSE/MAE/R² have wide confidence intervals and should be interpreted cautiously."
 
-### Cell 42 (code): Score distributions (propensity histogram by label, expected value dist)
+### Cell 43 (code): Score distributions (propensity histogram by label, expected value dist)
 
-### Cell 43 (markdown): Feature Importance Approach
+### Cell 44 (markdown): Feature Importance Approach
 > We use SHAP values instead of LightGBM's default split-based importance. Split importance counts how often a feature is used in tree splits — but correlated features (like `monetary_total` and `avg_order_value`) split the importance between them, making both appear less important than they are. SHAP values correctly attribute marginal contribution and handle correlated features by measuring each feature's impact on individual predictions.
 >
 > After analyzing importance, we prune features with near-zero SHAP values and retrain. Showing that AUC barely changes demonstrates ML judgment: we evaluated feature contribution and simplified the model without sacrificing performance.
 
-### Cell 44 (code): SHAP feature importance + pruning
+### Cell 45 (code): SHAP feature importance + pruning
 
 **Commit message pattern:** `Phase 5: Model evaluation and diagnostics`
 
@@ -287,7 +298,7 @@ lgb.LGBMClassifier(n_estimators=500, learning_rate=0.05, max_depth=6,
 ## PHASE 6: Final Output & Conclusions
 **Commit after completion**
 
-### Cell 45 (code): Per-user score table + top 20 ad targets
+### Cell 46 (code): Per-user score table + top 20 ad targets
 ```python
 final_output = DataFrame({
     'customer_unique_id': ...,
@@ -297,7 +308,7 @@ final_output = DataFrame({
 })
 ```
 
-### Cell 46 (markdown): Conclusions
+### Cell 47 (markdown): Conclusions
 > - Key EDA findings
 > - Model performance: LightGBM vs baselines (quantify the lift)
 > - Honest discussion of limitations:
