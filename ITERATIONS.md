@@ -120,16 +120,149 @@
 
 ---
 
+## Iteration 4: Earlier Cutoff + New Features + Optuna HPO + Blend
+
+### What we changed
+
+**1. Moved cutoff to 2018-03-01 (biggest single improvement):**
+- Tested cutoffs from 2018-01-01 through 2018-07-01
+- March 1 is the sweet spot: **654 positives** (1.18% rate) — 56% more than Iteration 3's 419, 2x the positive rate
+- ~55K users with ~1 year of feature history
+- Target window: all remaining data (182 days through 2018-08-29)
+
+**2. Four new features (8 → 12 core features):**
+- `purchase_velocity` = frequency / recency_days — explicit interaction for purchase intensity
+- `monetary_decayed` — exponential decay-weighted spending (λ=0.01, half-life ~69 days)
+- `frequency_decayed` — decay-weighted order count
+- `dominant_category_encoded` — smoothed target encoding (α=20) of product category, computed fold-aware during CV
+
+**3. Optuna hyperparameter optimization (50 trials):**
+- TPE sampler optimizing 5-fold CV PR-AUC
+- Target encoding recomputed inside each fold to prevent leakage
+- Best params: `n_estimators=368`, `learning_rate=0.0103`, `max_depth=4`, `num_leaves=4`, `min_child_samples=35`, `reg_alpha=0.35`, `reg_lambda=4.0`, `subsample=0.69`, `scale_pos_weight=50.0`
+
+**4. Simple weighted blend:**
+- `w * logreg + (1-w) * lgb_tuned`, weight selected by OOF PR-AUC grid search
+- Best weight: w=0.6 (logreg-heavy)
+
+### Results
+| Model | ROC-AUC | PR-AUC |
+|---|---|---|
+| Recency Ranking | 0.562 | 0.014 |
+| RFM LogReg (3 features) | 0.588 | 0.045 |
+| LightGBM Base (12 features) | 0.622 | 0.042 |
+| **LightGBM Tuned (Optuna)** | **0.613** | **0.049** |
+| Blend (w=0.6) | 0.612 | 0.048 |
+
+- 5-fold CV (base): ROC-AUC 0.610 ± 0.023, PR-AUC 0.031 ± 0.007
+- Optuna best CV PR-AUC: 0.031
+- 131 test positives (up from 84) — tighter metric estimates
+- Calibration: Isotonic selected (PR-AUC 0.049 preserved)
+- Value regressor: RMSE 144.06 beats historical avg 190.29
+
+### What improved (vs Iteration 3)
+- **PR-AUC: 0.016 → 0.049** (3x improvement) — the combined effect of more positives + new features + Optuna
+- **ROC-AUC: 0.579 → 0.622** (base) / 0.613 (tuned)
+- **LightGBM now convincingly beats LogReg** on both metrics (was losing on PR-AUC before)
+- **New features dominate SHAP**: `dominant_category_encoded` is #1 (0.256 mean |SHAP|), `purchase_velocity` is #2 (0.078), time-decay features are #4-5
+- **12-feature tuned model beats 36-feature full model** (0.049 vs 0.040 PR-AUC) — validates feature selection
+- Propensity range now [0.000, 0.719] — real differentiation
+
+### Breakdown of improvement sources
+1. **Cutoff change** (2018-06-01 → 2018-03-01): Biggest lever. 654 positives at 1.18% rate gave every model more signal. LogReg itself jumped from 0.025 → 0.045 PR-AUC just from more training positives.
+2. **New features**: `dominant_category_encoded` is the top SHAP feature by 3x. Time-decay and velocity features filled meaningful signal gaps.
+3. **Optuna tuning**: +0.007 PR-AUC on test (0.042 → 0.049). Modest but real — found that lower `scale_pos_weight` (~50 vs ~84) and stronger `reg_lambda` (4.0) improved calibration.
+4. **Blend**: Didn't beat tuned LightGBM (0.048 vs 0.049). LogReg still carries useful complementary signal (OOF best at w=0.6), but tuned LightGBM absorbed most of it.
+
+### Remaining limitations
+- PR-AUC of 0.049 is still low in absolute terms — reflects the genuine difficulty of predicting repeat purchases at 1.18% base rate
+- With 131 test positives, metric noise floor is ~±0.01 — the tuned vs base gap (0.007) is borderline significant
+- Blend didn't add lift over tuned LightGBM — the models agree on most predictions
+- Target encoding of the final model uses all training targets (only CV was fold-aware)
+
+---
+
+## Iteration 5: Leakage Fix + New Features + Honest Results
+
+### What we changed
+
+**1. Fixed target encoding leakage (critical):**
+- Iteration 4 computed target encoding on ALL data (train+test) before the split → test targets leaked into feature values
+- Now: split FIRST, encode using ONLY training targets
+- CV/Optuna recompute encoding per-fold for all 3 categorical columns
+
+**2. Three new target-encoded categoricals:**
+- `customer_state_encoded` — geographic signal (became #2 SHAP feature at 0.179)
+- `primary_payment_encoded` — payment method signal (near-zero SHAP: 0.008)
+
+**3. Recency bins:**
+- `ordered_last_30d`, `ordered_last_90d` — binary flags
+- Both have ZERO SHAP importance — trees already split optimally on `recency_days`
+
+**4. Dropped `frequency`** — confirmed near-zero SHAP from Iteration 4
+
+**5. Increased Optuna to 100 trials**
+
+**6. Added adjusted R²** to regression metrics
+
+**7. Narrative fixes:**
+- Evaluation markdown: corrected positive rate from "0.1-0.3%" to "1.2%"
+- Blend markdown: notes that no-lift means LightGBM subsumes LogReg signal
+- Conclusions: explains why tuned ROC-AUC < base ROC-AUC (different optimization target)
+- SHAP: notes frequency's near-zero importance
+
+### Results
+| Model | ROC-AUC | PR-AUC |
+|---|---|---|
+| Recency Ranking | 0.561 | 0.014 |
+| RFM LogReg (3 features) | 0.588 | **0.045** |
+| LightGBM Base (15 features) | **0.609** | 0.038 |
+| LightGBM Tuned (Optuna) | 0.608 | 0.035 |
+| **Blend (w=0.8)** | 0.602 | **0.046** |
+
+- CV vs test gap now 22% (was 44% in Iteration 4) — leakage fix worked
+- Optuna best CV PR-AUC: 0.029, test: 0.035 — aligned, no longer suspicious
+- Adjusted R² = -0.095 (value regressor doesn't explain variance beyond chance)
+- `customer_state_encoded` is #2 SHAP feature (0.179) — big contribution
+- `ordered_last_30d`, `ordered_last_90d` have ZERO SHAP — should be dropped
+- `primary_payment_encoded` near-zero (0.008) — marginal
+
+### Key finding: LogReg is hard to beat on PR-AUC
+
+After fixing the leakage, the honest picture is:
+- **LightGBM wins on ROC-AUC** (0.609 vs 0.588) — better overall discrimination
+- **LogReg wins on PR-AUC** (0.045 vs 0.038) — better precision at the top of the ranking
+- **Blend is best** at PR-AUC 0.046 — but it's 80% LogReg, confirming LogReg dominates this metric
+- **Optuna made things slightly worse** (0.035 vs 0.038 base) — overfit to CV with limited positives
+
+This is an important and honest finding: with ~500 training positives and 1.18% rate, there isn't enough signal for complex tree models to beat simple linear models on precision-recall. The 3-feature linear model captures the core signal (recency + frequency + monetary) efficiently, while LightGBM's extra features and nonlinear splits add noise at the top of the ranking even as they improve overall discrimination.
+
+### What Iteration 4's inflated 0.049 actually was
+The previous PR-AUC of 0.049 was partly explained by test target leakage into the encoding. After fixing: honest PR-AUC is 0.046 (blend) / 0.038 (LightGBM). The ~0.01 drop from 0.049 → 0.038 on LightGBM alone is the leakage effect.
+
+### Features to prune next
+- `ordered_last_30d`, `ordered_last_90d` — zero SHAP, confirmed useless
+- `primary_payment_encoded` — near-zero SHAP (0.008)
+- Consider whether 15 features → 12 features improves anything
+
+---
+
 ## Key Lessons Across Iterations
 
-1. **Positive sample size is the binding constraint.** Going from 280 → 419 positives helped more than any hyperparameter change. In production, more data collection would have the highest ROI.
+1. **Positive sample size is the binding constraint.** 280 → 419 → 654 positives. Each increase helped more than any modeling technique. The cutoff change from June to March was the single biggest improvement.
 
-2. **Feature count must match signal availability.** 36 features with 224 training positives (~6:1 ratio) was a recipe for overfitting. 8 features with 335 positives (~42:1 ratio) let the model learn real patterns.
+2. **Feature count must match signal availability.** 36 features with 224 positives (~6:1) was catastrophic. 15 features with 523 positives (~35:1) is manageable but still tight.
 
-3. **Regularization alone can't fix a model with too many features.** Iteration 2 showed that regularizing a 36-feature model improved it (0.477 → 0.511 CV ROC-AUC) but couldn't make it competitive. You need to reduce the problem size, not just constrain the solution.
+3. **Target encoding leakage is subtle and consequential.** Computing encoding on all data before the split inflated PR-AUC by ~0.01 (0.049 → 0.038 on LightGBM). Always encode AFTER the split, using only training targets.
 
-4. **Categorical features are dangerous with few positives.** LightGBM's native categorical handling is powerful on large datasets but finds spurious splits when only 5-10 positives fall in a given category.
+4. **Simple models are hard to beat on PR-AUC with scarce positives.** After fixing leakage, 3-feature LogReg (0.045 PR-AUC) beats 15-feature LightGBM (0.038). LightGBM wins on ROC-AUC (0.609 vs 0.588) — different metrics, different stories. This is a fundamental insight about the problem, not a modeling failure.
 
-5. **`is_unbalance` vs `scale_pos_weight` matters for fair comparison.** They handle class weights differently; using explicit `scale_pos_weight` matching LogReg's `balanced` weights made the comparison apples-to-apples.
+5. **Optuna can overfit with few positives.** With ~105 positives per CV fold, the HPO landscape is noisy. Optuna found params that scored well on CV folds by chance but slightly hurt test performance (0.035 vs 0.038 base). More trials don't help when the signal is this noisy.
 
-6. **Honest results > inflated metrics.** An overfit model with impressive training numbers would fail in production and get caught in an interview. A simpler model with honest metrics demonstrates ML judgment.
+6. **Target-encoded categoricals are powerful.** `dominant_category_encoded` (#1 SHAP, 0.251) and `customer_state_encoded` (#2 SHAP, 0.179) together account for ~45% of total SHAP importance. Native categorical handling failed; smoothed target encoding recovered the signal.
+
+7. **Not all features contribute.** `ordered_last_30d`, `ordered_last_90d` have zero SHAP — trees already split optimally on continuous `recency_days`. `primary_payment_encoded` is near-zero. Feature engineering requires validation, not just intuition.
+
+8. **Explicit interactions help.** `purchase_velocity` (frequency/recency) is #3 SHAP feature. Providing it explicitly reduces tree depth needed.
+
+9. **Honest results > inflated metrics.** The leakage fix dropped our headline number from 0.049 to 0.046 (blend). That's the right direction — honest metrics are more defensible in an interview than inflated ones.

@@ -9,7 +9,7 @@ Deliverable: executed notebook with results, ready for interview discussion.
 
 ## Setup
 - Python 3, venv: `python3 -m venv venv && source venv/bin/activate`
-- Deps: `pip install pandas numpy matplotlib seaborn scikit-learn lightgbm jupyter notebook shap`
+- Deps: `pip install pandas numpy matplotlib seaborn scikit-learn lightgbm jupyter notebook shap optuna`
 - Dataset location: `datasets/`
 
 ---
