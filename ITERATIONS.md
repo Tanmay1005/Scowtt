@@ -247,6 +247,69 @@ The previous PR-AUC of 0.049 was partly explained by test target leakage into th
 
 ---
 
+## Iteration 6: Momentum Features + Log-Transform Value + Time-Series CV
+
+### What we changed
+
+**1. Four new momentum features:**
+- `avg_days_between_orders` — actual inter-order gap for 1,623 multi-order users (NaN for single-order, LightGBM handles natively)
+- `avg_review_delay_days` — days from delivery to review creation (user engagement signal)
+- `spending_trend` — slope of order values over time for multi-order users
+- `late_delivery_ratio` — fraction of orders delivered late (more granular than binary `ever_late`)
+
+**2. Pruned 3 dead features:** `ordered_last_30d`, `ordered_last_90d` (zero SHAP), `primary_payment_encoded` (near-zero). Net: 15 → 16 features.
+
+**3. Log-transform value model:** Train on `log(1+value)` to handle right-skewed order values.
+
+**4. Expanding-window time-series CV:** Train on months 1..k, validate on month k+1. More honest than stratified CV.
+
+**5. Rejected bad suggestions (with reasoning):**
+- SMOTE/ADASYN: Provably equivalent to class weights for trees. `scale_pos_weight` already handles this.
+- Stacking meta-learner: Overfits on ~520 OOF predictions. Already proved with blending.
+- Holiday flags: Constant per user at a fixed cutoff date — useless.
+- Tweedie loss: Hurdle model already separates P(purchase) from E[value|purchase]. No zeros in stage 2.
+
+### Results
+| Model | ROC-AUC | PR-AUC |
+|---|---|---|
+| Recency Ranking | 0.561 | 0.014 |
+| RFM LogReg (3 features) | 0.588 | 0.045 |
+| LightGBM Base (16 features) | 0.609 | **0.045** |
+| LightGBM Tuned (Optuna) | **0.622** | 0.036 |
+| **Blend (w=0.7)** | **0.626** | **0.047** |
+
+- Time-series CV: ROC-AUC 0.600 ± 0.019, PR-AUC 0.029 ± 0.010 (vs stratified 0.626/0.030)
+- CV-test gap: 21% — stable, no leakage signal
+- Value model: R² = -0.091, Adjusted R² = -0.244 (negative — regressor doesn't help in this regime)
+
+### Key findings
+
+**1. LightGBM Base now matches LogReg on PR-AUC (0.045 vs 0.045).** This is the first time LightGBM is competitive on PR-AUC after fixing leakage. The momentum features helped — base went from 0.038 (Iteration 5) to 0.045.
+
+**2. Blend is the best model at 0.047 PR-AUC.** Weight w=0.7 (70% LogReg, 30% LightGBM). LightGBM now adds real complementary signal.
+
+**3. Optuna hurts PR-AUC again (0.036 vs 0.045 base).** But it helps ROC-AUC (0.622 vs 0.609). The tuned model is a different operating point — high `scale_pos_weight=139` creates more aggressive positive predictions.
+
+**4. Time-series CV is more honest.** Stratified CV gives ROC 0.626, time-series gives 0.600. The ~0.026 gap is the cost of temporal honesty. Both show the model works, but time-series is more realistic.
+
+**5. Momentum features have modest SHAP (3.8%):**
+- `avg_review_delay_days` = 0.034 (most useful)
+- `avg_days_between_orders` = 0.010
+- `spending_trend` = 0.007
+- `late_delivery_ratio` = 0.000 (zero — could be pruned)
+
+The target-encoded categoricals dominate: `dominant_category_encoded` (0.374) and `customer_state_encoded` (0.265) together account for ~48% of total SHAP. The momentum features help at the margin but the main signal is "what did they buy" and "where are they from."
+
+**6. Log-transform didn't help the value model.** R² is still negative. With 131 test purchasers and high variance, no regressor can learn meaningful patterns.
+
+### Leakage checks
+- Target encoding: computed on training data only, recomputed per fold during CV/Optuna
+- Features: all derived from pre-cutoff orders only
+- CV-test gap: 21% — within expected range for ~105 positives per fold
+- Time-series CV: expanding windows ensure no future data leaks into training
+
+---
+
 ## Key Lessons Across Iterations
 
 1. **Positive sample size is the binding constraint.** 280 → 419 → 654 positives. Each increase helped more than any modeling technique. The cutoff change from June to March was the single biggest improvement.
