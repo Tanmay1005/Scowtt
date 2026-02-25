@@ -385,22 +385,82 @@ The target-encoded categoricals dominate: `dominant_category_encoded` (0.374) an
 
 ---
 
-## Key Lessons Across Iterations
+## Iteration 9: Model Shootout (XGBoost, Grid Search, Randomized Search)
 
-1. **Positive sample size is the binding constraint.** 280 → 419 → 654 positives. Each increase helped more than any modeling technique. The cutoff change from June to March was the single biggest improvement.
+### What we did
+- **Model shootout**: LightGBM base vs XGBoost with early stopping (`eval_metric='aucpr'`, patience=50)
+- **Grid search**: 4 combos (`n_estimators` x `num_leaves`) with custom safe PR-AUC scorer
+- **Randomized search**: 10 random combos across 5 hyperparameters with same safe scorer
+- **Selection threshold**: Search model must beat base by >0.001 PR-AUC to be selected (prevents noise-driven selection)
+- **CatBoost excluded**: Its `l2_leaf_reg` operates on different scales than LightGBM's `reg_lambda` — a fair comparison requires separate tuning, which faces the same HPO noise problem documented in the Optuna section
 
-2. **Feature count must match signal availability.** 36 features with 224 positives (~6:1) was catastrophic. 15 features with 523 positives (~35:1) is manageable but still tight.
+### Shootout CV Results (5-fold PR-AUC)
+| Model | CV PR-AUC |
+|---|---|
+| XGBoost (early stop, avg iter=33) | 0.0312 |
+| LightGBM Base (300 iter) | 0.0254 |
 
-3. **Target encoding leakage is subtle and consequential.** Computing encoding on all data before the split inflated PR-AUC by ~0.01 (0.049 → 0.038 on LightGBM). Always encode AFTER the split, using only training targets.
+XGBoost wins CV but shows high variance in early stopping iterations (4 to 83 across folds).
 
-4. **Simple models are hard to beat on PR-AUC with scarce positives.** After fixing leakage, 3-feature LogReg (0.045 PR-AUC) beats 15-feature LightGBM (0.038). LightGBM wins on ROC-AUC (0.609 vs 0.588) — different metrics, different stories. This is a fundamental insight about the problem, not a modeling failure.
+### Test Set Results
+| Model | ROC-AUC | PR-AUC |
+|---|---|---|
+| **LightGBM Base (15-feat)** | **0.604** | **0.047** |
+| XGBoost | 0.605 | 0.045 |
+| LightGBM Random Search | 0.599 | 0.045 |
+| LightGBM Grid Search | 0.605 | 0.044 |
+| Blend (raw, w=0.55) | 0.609 | 0.046 |
+| RFM LogReg | 0.588 | 0.045 |
 
-5. **Optuna can overfit with few positives.** With ~105 positives per CV fold, the HPO landscape is noisy. Optuna found params that scored well on CV folds by chance but slightly hurt test performance (0.035 vs 0.038 base). More trials don't help when the signal is this noisy.
+- **Best: LightGBM Base at PR-AUC 0.047** — search models did not meaningfully beat base
+- Top decile lift: **2.44x** (preserved from iter 8 by using base model)
+- Top 10% captures **24.4%** of converters
+- Brier: Raw 0.196 -> Platt 0.012
 
-6. **Target-encoded categoricals are powerful.** `dominant_category_encoded` (#1 SHAP, 0.251) and `customer_state_encoded` (#2 SHAP, 0.179) together account for ~45% of total SHAP importance. Native categorical handling failed; smoothed target encoding recovered the signal.
+### Fixes from initial iteration 9 attempt
+1. **Removed LightGBM early stopping**: With `average_precision` as eval metric and ~100 positives per fold, LightGBM stopped at iteration 1 (signal too noisy). Removed entirely rather than show misleading results.
+2. **Fixed NaN CV scores**: `make_scorer(average_precision_score)` produced NaN when folds had degenerate predictions. Replaced with custom scorer returning 0.0 for edge cases.
+3. **CatBoost dropped**: Rather than present an unfair comparison with un-tuned CatBoost (`l2_leaf_reg=3.0` != `reg_lambda=1.0`), we explain the limitation.
+4. **Selection threshold**: Initial run accidentally selected RandomizedSearch (PR-AUC 0.049) due to NaN-corrupted CV ranking. With proper scoring, search models don't meaningfully beat base. Added >0.001 threshold to prevent noise-driven selection.
+5. **Conclusions updated**: Added "Model Comparison" section documenting that the signal ceiling is data-driven, not algorithm-driven.
 
-7. **Not all features contribute.** `ordered_last_30d`, `ordered_last_90d` have zero SHAP — trees already split optimally on continuous `recency_days`. `primary_payment_encoded` is near-zero. Feature engineering requires validation, not just intuition.
+### Key insights
+1. **Grid and randomized search confirm manual params are near-optimal.** Grid best (0.044) and random best (0.045) both fell short of base (0.047). The base hyperparameters were already well-chosen for this data regime.
+2. **XGBoost competitive on ROC-AUC (0.605) but not on PR-AUC (0.045).** Different tree implementations make different precision-recall tradeoffs at extreme imbalance.
+3. **The signal ceiling is data-driven, not algorithm-driven.** Three algorithms (LightGBM, XGBoost, LightGBM variants) all converge to PR-AUC 0.044-0.047. No algorithm can extract substantially more signal from ~650 positives with these features.
+4. **Early stopping is unreliable with scarce positives.** Even XGBoost's built-in `aucpr` metric shows high variance across folds (4 to 83 iterations). LightGBM's PR-AUC was too noisy to provide any stopping signal.
 
-8. **Explicit interactions help.** `purchase_velocity` (frequency/recency) is #3 SHAP feature. Providing it explicitly reduces tree depth needed.
+---
 
-9. **Honest results > inflated metrics.** The leakage fix dropped our headline number from 0.049 to 0.046 (blend). That's the right direction — honest metrics are more defensible in an interview than inflated ones.
+## Key Lessons Across All 9 Iterations
+
+### Data > Algorithms
+1. **Positive sample size is the binding constraint.** 280 -> 419 -> 654 positives. Each increase helped more than any modeling technique. The cutoff change from June to March was the single biggest improvement.
+2. **The signal ceiling is data-driven, not algorithm-driven.** LightGBM, XGBoost, grid search, randomized search, and blending all converge to PR-AUC 0.044-0.047. No algorithm can extract more signal from ~650 positives with these features. (Iter 9)
+
+### Feature Engineering
+3. **Feature count must match signal availability.** 36 features with 224 positives (~6:1) was catastrophic. 15 features with 523 positives (~35:1) is manageable. (Iters 1-3)
+4. **Target-encoded categoricals are powerful.** `dominant_category_encoded` and `customer_state_encoded` together account for ~48% of total SHAP. Native categorical handling failed; smoothed target encoding recovered the signal. (Iters 4-6)
+5. **Not all features contribute.** `ordered_last_30d`, `ordered_last_90d` had zero SHAP. `primary_payment_encoded` near-zero. `late_delivery_ratio` zero. Feature engineering requires validation, not just intuition. (Iters 5-7)
+6. **Explicit interactions help.** `purchase_velocity` (frequency/recency) is a top SHAP feature. Providing it explicitly reduces tree depth needed. (Iter 4)
+
+### Encoding & Leakage
+7. **Target encoding leakage is subtle and consequential.** Computing encoding on all data before the split inflated PR-AUC by ~0.01 (0.049 -> 0.038). Always encode AFTER the split, using only training targets. (Iter 5)
+8. **OOF fold count matters.** 3-fold OOF encoding beat 5-fold and 10-fold because more data per fold = less noisy encoding maps with scarce positives. (Iter 8)
+
+### HPO & Model Selection
+9. **Optuna/HPO overfits with few positives.** Tested across 3 iterations (50 trials, 100 trials, 25 trials tight). Every time: CV improved, test degraded. ~100 positives per fold is too noisy for adaptive optimization. (Iters 4-8)
+10. **Grid and randomized search confirm manual params are near-optimal.** Grid (4 combos) and random (10 combos) both fell short of base LightGBM. The manual hyperparameters were already well-chosen. (Iter 9)
+11. **Early stopping is unreliable with scarce positives.** LightGBM stopped at iteration 1 (PR-AUC too noisy per-fold). XGBoost fared better but showed high variance (4 to 83 across folds). (Iter 9)
+12. **CatBoost needs separate tuning.** Its `l2_leaf_reg` operates on different scales than LightGBM's `reg_lambda`. Without separate tuning (which faces the same HPO noise problem), CatBoost comparisons are unfair. (Iter 9)
+
+### Evaluation & Honesty
+13. **Simple models are hard to beat on PR-AUC with scarce positives.** 3-feature LogReg matched 15-feature LightGBM on PR-AUC (0.045 each). LightGBM wins on ROC-AUC (0.604 vs 0.588). Different metrics tell different stories. (Iters 5-6)
+14. **Lift metrics tell a clearer business story than PR-AUC.** Top decile lift of 2.44x and "top 10% captures 24.4% of converters" are more actionable than PR-AUC 0.047. (Iters 7-8)
+15. **Honest results > inflated metrics.** The leakage fix dropped our headline number. The Optuna removal kept it stable. Both were the right decisions — honest metrics are more defensible in an interview. (Iters 5, 7)
+
+### Final Model
+- **Winner**: LightGBM Base (15 features, 3-fold OOF TE, `n_estimators=300, max_depth=3, num_leaves=7, min_child_samples=50, reg_alpha=1.0, reg_lambda=1.0`)
+- **PR-AUC**: 0.047 | **ROC-AUC**: 0.604 | **Brier**: 0.196 raw, 0.012 Platt-calibrated
+- **Lift**: 2.44x top decile, top 10% captures 24.4% of converters
+- **Value**: Hierarchical historical average (user -> cohort -> global), no regressor (negative R-squared)
